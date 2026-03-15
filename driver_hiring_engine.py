@@ -421,12 +421,47 @@ def fmt_sched(scheds, dtype="Saudi"):
     return texts
 
 # ============================================================
+# AUTHENTICATION
+# ============================================================
+
+USERS = {
+    "admin": "DailyFood@2026",
+    "subham": "delivery123",
+}
+
+def check_login():
+    if 'authenticated' not in st.session_state:
+        st.session_state['authenticated'] = False
+
+    if st.session_state['authenticated']:
+        return True
+
+    st.title("🔒 Driver Hiring Engine")
+    st.caption("Please login to continue")
+
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        if st.button("Login", type="primary", use_container_width=True):
+            if username in USERS and USERS[username] == password:
+                st.session_state['authenticated'] = True
+                st.session_state['username'] = username
+                st.rerun()
+            else:
+                st.error("Invalid username or password")
+    return False
+
+# ============================================================
 # MAIN APP
 # ============================================================
 
 def main():
+    if not check_login():
+        return
+
     st.title("🚗 Driver Hiring Engine v3")
-    st.caption("Saudi (real marginals + staggered) + Expat Pipeline")
+    st.caption(f"Saudi (real marginals + staggered) + Expat Pipeline — Logged in as: {st.session_state.get('username', '')}")
 
     with st.sidebar:
         st.header("📁 Input Files")
