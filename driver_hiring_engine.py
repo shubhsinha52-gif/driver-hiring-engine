@@ -461,8 +461,8 @@ def main():
     st.markdown("---")
     c1,c2,c3,c4=st.columns(4)
     for c,num,name,icon,done,unlocked in [
-        (c1,1,"Saudi Hiring","⚔️",s1,True),(c2,2,"Expat Hiring","🏹",s2,s1),
-        (c3,3,"SFT+EFT Scheduling","🏰",s3,s2),(c4,4,"MC Scheduling","🐉",s4,s3)]:
+        (c1,1,"Saudi Hiring","🍕",s1,True),(c2,2,"Expat Hiring","🍔",s2,s1),
+        (c3,3,"SFT+EFT Scheduling","🥪",s3,s2),(c4,4,"MC Scheduling","🛵",s4,s3)]:
         cls="stage-done" if done else ("stage-card" if unlocked else "stage-card stage-locked")
         status="✅ Complete" if done else ("🔓 Ready" if unlocked else "🔒 Locked")
         c.markdown(f"<div class='{cls}'><h2>{icon}</h2><h3>Stage {num}</h3><p>{name}</p><small>{status}</small></div>",unsafe_allow_html=True)
@@ -488,10 +488,10 @@ def main():
     if test: brs=brs[:10]
 
     # ═══ STAGE 1: Saudi Hiring ═══
-    stage=st.radio("Select Stage",["⚔️ Stage 1: Saudi Hiring","🏹 Stage 2: Expat Hiring","🏰 Stage 3: SFT+EFT Scheduling","🐉 Stage 4: MC Scheduling"],horizontal=True)
+    stage=st.radio("Select Stage",["🍕 Stage 1: Saudi Hiring","🍔 Stage 2: Expat Hiring","🥪 Stage 3: SFT+EFT Scheduling","🛵 Stage 4: MC Scheduling"],horizontal=True)
 
     if "Stage 1" in stage:
-        st.header("⚔️ Stage 1: Saudi Hiring (Real Marginals)")
+        st.header("🍕 Stage 1: Saudi Hiring (Real Marginals)")
         c1,c2,c3=st.columns(3); c1.metric("Branches",len(brs)); c2.metric("5D",sum(1 for b in brs if bt.get(b)=='5D')); c3.metric("6D",sum(1 for b in brs if bt.get(b)=='6D'))
 
         if st.button("🚀 Launch Saudi Campaign",type="primary",use_container_width=True):
@@ -541,7 +541,7 @@ def main():
             st.download_button("📥 Download Saudi Results",to_xl({'Summary':pd.DataFrame([{'Drivers':s['td'],'Profit':round(s['tp'],2)}]),'Allocations':s['al'],'Schedules':s['sc'],'Coverage':s['cv'],'Attribution':s['at'],'Marginals':s['mg']}),file_name="Saudi_Results.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     elif "Stage 2" in stage:
-        st.header("🏹 Stage 2: Expat Hiring")
+        st.header("🍔 Stage 2: Expat Hiring")
         if not s1: st.warning("🔒 Complete Stage 1 first"); return
         if not eft_f: st.warning("Upload EFT Developer File"); return
         if not cars_f: st.warning("Upload Cars Restriction"); return
@@ -599,14 +599,14 @@ def main():
             with tabs[2]: st.dataframe(e['cv'],use_container_width=True,height=400)
 
     elif "Stage 3" in stage:
-        st.header("🏰 Stage 3: SFT+EFT Combined Scheduling")
+        st.header("🥪 Stage 3: SFT+EFT Combined Scheduling")
         if not s2: st.warning("🔒 Complete Stage 2 first"); return
         st.info("Stage 3 uses the SFT+EFT Scheduling code (Employee_restriction_.xlsx based). Upload the scheduling output or run the standalone SFT_EFT code, then use the Employee Attribution VBA for profit/order/hours/productivity per employee.")
         st.markdown("**Employee Attribution VBA** has been provided separately for the `Th_Saudis_(8h_5d).xlsm` file.")
         st.session_state['s3_done']=True
 
     elif "Stage 4" in stage:
-        st.header("🐉 Stage 4: MC Scheduling")
+        st.header("🛵 Stage 4: MC Scheduling")
         if not s3: st.warning("🔒 Complete Stage 3 first"); return
 
         if st.button("🚀 Launch MC Campaign",type="primary",use_container_width=True):
