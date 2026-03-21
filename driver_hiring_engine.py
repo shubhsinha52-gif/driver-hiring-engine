@@ -1,662 +1,694 @@
 """
-🚗 Driver Hiring Engine v3.0 — Saudi + Expat Pipeline
-============================================================
-SFT: Real GA-marginals (profit lookup per branch per size) + staggered schedules
-EFT: Auto-optimal with car constraint
-Car constraint enforced in GA fitness (allows staggered >max_cars schedules)
-
-Install:  pip install streamlit pandas numpy openpyxl
-Run:      streamlit run driver_hiring_engine.py
+🍕 Maestro Pizza — Driver & MC Hiring Engine v4.0
+Age of Empires Style: 4 Campaign Stages
+Stage 1: Saudi Hiring | Stage 2: Expat Hiring | Stage 3: SFT+EFT Scheduling | Stage 4: MC Scheduling
 """
-
-import streamlit as st
-import pandas as pd
-import numpy as np
-import random
-import copy
-import io
-import time
+import streamlit as st, pandas as pd, numpy as np, random, copy, io, time, math
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 
-st.set_page_config(page_title="Driver Hiring Engine", page_icon="🚗", layout="wide")
+st.set_page_config(page_title="Maestro Pizza — Hiring Engine", page_icon="🍕", layout="wide")
+DN = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat']
 
-DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+# ═══════════════════ THEME ═══════════════════
+st.markdown("""<style>
+[data-testid="stAppViewContainer"]{background:linear-gradient(180deg,#f0faf0 0%,#fff 100%)}
+[data-testid="stSidebar"]{background:#1b5e20;color:#fff}
+[data-testid="stSidebar"] label,.css-1cpxqw2{color:#fff!important}
+.stButton>button{background:#2e7d32!important;color:#fff!important;border:none;font-weight:700;border-radius:8px}
+.stButton>button:hover{background:#1b5e20!important}
+div[data-testid="stMetric"]{background:#e8f5e9;border-radius:12px;padding:16px;border-left:4px solid #2e7d32}
+.stage-card{background:#fff;border:2px solid #c8e6c9;border-radius:16px;padding:24px;text-align:center;
+  box-shadow:0 4px 12px rgba(0,0,0,.08);transition:.3s}
+.stage-card:hover{border-color:#2e7d32;box-shadow:0 6px 20px rgba(46,125,50,.2)}
+.stage-locked{opacity:.5;filter:grayscale(60%)}
+.stage-done{border-color:#2e7d32;background:#e8f5e9}
+h1,h2,h3{color:#1b5e20!important}
+</style>""", unsafe_allow_html=True)
 
-# ============================================================
-# DATA STRUCTURES
-# ============================================================
-
-@dataclass
-class DriverShift:
-    start_hour: int
-    is_working: bool
-    shift_length: int = 8
-    def get_hours(self):
-        if not self.is_working or self.start_hour < 0: return []
-        return [(self.start_hour + i) % 24 for i in range(self.shift_length)]
-
-@dataclass
-class DriverSchedule:
-    shifts: List[DriverShift] = field(default_factory=list)
-    def get_work_days(self): return sum(1 for s in self.shifts if s.is_working)
-
-# ============================================================
-# DATA LOADING
-# ============================================================
-
-@st.cache_data(show_spinner=False)
-def load_sft_data(file_bytes):
-    l5 = pd.read_excel(file_bytes, sheet_name='Logics_5D', header=2)
-    l5.columns = ['DRIVERS','DEMAND','T_CAP','UTIL','INTERNAL','A_CAP','PROFIT']
-    logics_5d = {}
-    for _, r in l5.dropna(subset=['DRIVERS']).iterrows():
-        logics_5d[(int(r['DRIVERS']), int(r['DEMAND']), float(r['T_CAP']))] = {
-            'profit': float(r['PROFIT']), 'util': float(r['UTIL'])}
-
-    l6 = pd.read_excel(file_bytes, sheet_name='Logics_6D', header=2)
-    l6.columns = ['DRIVERS','DEMAND','T_CAP','UTIL','INTERNAL','A_CAP','PROFIT']
-    logics_6d = {}
-    for _, r in l6.dropna(subset=['DRIVERS']).iterrows():
-        logics_6d[(int(r['DRIVERS']), int(r['DEMAND']), float(r['T_CAP']))] = {
-            'profit': float(r['PROFIT']), 'util': float(r['UTIL'])}
-
-    cdf = pd.read_excel(file_bytes, sheet_name='Capacity', header=2)
-    cdf.columns = [str(c).strip() for c in cdf.columns]
-    capacity = {}
-    for _, r in cdf.dropna(subset=['branch_name']).iterrows():
-        capacity[(str(r['branch_name']).strip(), int(r['Weekday (shift)']))] = float(r['Adj.m'])
-
-    sm = pd.read_excel(file_bytes, sheet_name='Staffing model_5D', header=None, skiprows=4)
-    demand = {}; branch_types = {}; branches = []; prev_br = ''
-    for _, row in sm.iterrows():
-        br = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ''
-        if not br or br == 'Branch': continue
-        hr = int(row.iloc[1]) if pd.notna(row.iloc[1]) else 0
-        for d in range(7):
-            v = row.iloc[2 + d]
-            demand[(br, hr, d + 1)] = int(v) if pd.notna(v) and str(v).strip() != '' else 0
-        if hr == 0:
-            if br != prev_br: branches.append(br); prev_br = br
-            bs = str(row.iloc[70]).strip().upper() if len(row) > 70 and pd.notna(row.iloc[70]) else ''
-            branch_types[br] = '6D' if bs == '6D' else '5D'
-    return logics_5d, logics_6d, capacity, demand, branch_types, branches
-
-@st.cache_data(show_spinner=False)
-def load_eft_data(file_bytes):
-    ldf = pd.read_excel(file_bytes, sheet_name='Logics EFT', header=0)
-    ldf.columns = [c.strip() for c in ldf.columns]
-    logics_eft = {}
-    for _, r in ldf.dropna(subset=['DRIVERS']).iterrows():
-        logics_eft[(int(r['DRIVERS']), int(r['DEMAND']), float(r['T. CAPACITY']))] = {
-            'profit': float(r['PROFIT/HR. (vs. 3P)']), 'util': float(r['UTILIZATION  %'])}
-    cdf = pd.read_excel(file_bytes, sheet_name='Capacity', header=2)
-    cdf.columns = [c.strip() for c in cdf.columns]
-    cap_eft = {}
-    for _, r in cdf.dropna(subset=['branch_name']).iterrows():
-        cap_eft[(str(r['branch_name']).strip(), int(r['Weekday (shift)']))] = float(r['Adj.m'])
-    return logics_eft, cap_eft
-
-@st.cache_data(show_spinner=False)
-def load_cars_data(file_bytes):
-    df = pd.read_excel(file_bytes)
-    df.columns = ['Branch', 'Hr'] + [str(d) for d in range(1, 8)]
-    cars = {}
-    for br in df['Branch'].unique():
-        bd = df[df['Branch'] == br]; mat = np.zeros((24, 7), int)
-        for _, row in bd.iterrows():
-            h = int(row['Hr'])
-            if 0 <= h < 24:
-                for d in range(7): mat[h, d] = int(row[str(d + 1)])
-        cars[str(br).strip()] = mat
-    return cars
-
-@st.cache_data(show_spinner=False)
-def load_restricted(file_bytes):
-    if file_bytes is None: return set()
-    return set(pd.read_excel(file_bytes).iloc[:, 0].astype(str).str.strip())
-
-# ============================================================
-# CASE MATRIX GENERATION (replaces VBA)
-# ============================================================
-
-def generate_cases(branches, demand, capacity, logics, branch_types, target_type):
-    case_maps = {}
-    for br in branches:
-        if branch_types.get(br) != target_type: continue
-        matrices = []
-        for cn in range(1, 7):
-            mat = np.zeros((24, 7))
-            for hr in range(24):
-                for day in range(1, 8):
-                    dem = min(demand.get((br, hr, day), 0), 12)
-                    cap = capacity.get((br, day), 2.0)
-                    lk = logics.get((cn, dem, cap))
-                    if lk: mat[hr, day - 1] = lk['profit']
-            matrices.append(mat)
-        case_maps[br] = matrices
-    return case_maps
-
-def compute_remaining(branches, demand, capacity, logics_5d, logics_6d, branch_types, saudi_cov):
-    remaining = {}
-    for br in branches:
-        bt = branch_types.get(br, '5D'); lg = logics_5d if bt == '5D' else logics_6d
-        scov = saudi_cov.get(br, np.zeros((24, 7), int))
-        for hr in range(24):
-            for day in range(1, 8):
-                dem = demand.get((br, hr, day), 0); drivers = int(scov[hr, day - 1])
-                if drivers == 0 or dem == 0: remaining[(br, hr, day)] = dem; continue
-                cap = capacity.get((br, day), 2.0)
-                lk = lg.get((drivers, min(dem, 12), cap), {'util': 0})
-                util = min(lk['util'], 1.0); served = round(min(util * cap * drivers, dem))
-                remaining[(br, hr, day)] = max(dem - served, 0)
-    return remaining
-
-# ============================================================
-# SFT OPTIMIZER — Real Marginals + Staggered (SFT_Hiring_14032026)
-# ============================================================
-
-def create_random_schedule(stype):
-    start = random.randint(0, 23)
-    if stype == '5D':
-        off1 = random.randint(0, 6); offs = {off1, (off1 + 1) % 7}
-    else:
-        offs = {random.randint(0, 6)}
-    return DriverSchedule([DriverShift(-1, False) if d in offs
-        else DriverShift((start + random.randint(-2, 2)) % 24, True) for d in range(7)])
-
-def create_staggered_schedule(stype, driver_idx, num_drivers):
-    time_bands = [[16,17,18],[19,20,21],[8,9,10],[11,12,13],[14,15],[22,23,0]]
-    band = time_bands[driver_idx % len(time_bands)]
-    start = random.choice(band)
-    if stype == '5D':
-        off1 = (driver_idx * 2) % 7; offs = {off1, (off1 + 1) % 7}
-    else:
-        offs = {(driver_idx * 2) % 7}
-    return DriverSchedule([DriverShift(-1, False) if d in offs
-        else DriverShift((start + random.randint(-1, 1)) % 24, True) for d in range(7)])
-
-def sft_calc_profit(schedules, cases, car_mat):
-    cov = np.zeros((24, 7), int)
-    for sc in schedules:
-        for di, sh in enumerate(sc.shifts):
-            if sh.is_working:
-                for h in sh.get_hours(): cov[h, di] += 1
-    if car_mat is not None:
-        if np.any(cov > car_mat): return -999999.0
-    total = 0.0
-    for h in range(24):
-        for d in range(7):
-            n = cov[h, d]
-            if n > 0:
-                ci = min(n - 1, len(cases) - 1); total += cases[ci][h, d]
-    return total
-
-def optimize_at_size(n_drv, stype, cases, car_mat, pop_size=100, gens=60):
-    if n_drv == 0: return 0.0, []
-    max_cars = int(car_mat.max()); constrained = n_drv > max_cars
-    if constrained: pop_size = max(pop_size, 200); gens = max(gens, 100)
-    pop = []
-    for pi in range(pop_size):
-        if constrained and pi < pop_size // 2:
-            team = [create_staggered_schedule(stype, i, n_drv) for i in range(n_drv)]
-        else:
-            team = [create_random_schedule(stype) for _ in range(n_drv)]
-        pop.append((team, sft_calc_profit(team, cases, car_mat)))
-    for _ in range(gens):
-        pop.sort(key=lambda x: x[1], reverse=True)
-        el = max(1, int(pop_size * 0.2)); new = pop[:el]
-        while len(new) < pop_size:
-            par = random.choice(pop[:el])
-            child = [copy.deepcopy(s) for s in par[0]]
-            idx = random.randint(0, n_drv - 1)
-            if random.random() < 0.3:
-                if constrained and random.random() < 0.5:
-                    child[idx] = create_staggered_schedule(stype, idx, n_drv)
-                else:
-                    child[idx] = create_random_schedule(stype)
-            else:
-                for i, sh in enumerate(child[idx].shifts):
-                    if sh.is_working:
-                        child[idx].shifts[i] = DriverShift(
-                            (sh.start_hour + random.choice([-2,-1,0,1,2])) % 24, True); break
-            new.append((child, sft_calc_profit(child, cases, car_mat)))
-        pop = new
-    best = max(pop, key=lambda x: x[1])
-    return best[1], best[0]
-
-def build_profit_lookup(branches, branch_types, cases_5d, cases_6d, cars, restricted, pop_size, gens, progress_cb=None):
-    lookup = {}
-    eligible = [b for b in branches if b not in restricted]
-    for idx, br in enumerate(eligible):
-        bt = branch_types.get(br, '5D')
-        cs = cases_5d.get(br, []) if bt == '5D' else cases_6d.get(br, [])
-        car_mat = cars.get(br, np.full((24, 7), 6))
-        if not cs: continue
-        lookup[br] = {0: (0.0, [])}
-        max_size = min(6, len(cs))
-        for size in range(1, max_size + 1):
-            p, scheds = optimize_at_size(size, bt, cs, car_mat, pop_size, gens)
-            lookup[br][size] = (p, scheds)
-            if size >= 2:
-                m1 = lookup[br][size][0] - lookup[br][size-1][0]
-                m0 = lookup[br][size-1][0] - lookup[br][size-2][0]
-                if m1 < -500 and m0 < -500:
-                    for s in range(size + 1, max_size + 1):
-                        lookup[br][s] = (p - 999999, [])
-                    break
-        if progress_cb: progress_cb(idx + 1, len(eligible), br)
-    return lookup
-
-def greedy_allocate_real(target, lookup):
-    alloc = {b: 0 for b in lookup}
-    for _ in range(target):
-        best_br, best_m = None, -float('inf')
-        for br in lookup:
-            ns = alloc[br] + 1
-            if ns not in lookup[br]: continue
-            pn = lookup[br][ns][0]
-            if pn <= -999000: continue
-            m = pn - lookup[br][alloc[br]][0]
-            if m > best_m: best_m = m; best_br = br
-        if best_br: alloc[best_br] += 1
-        else: break
-    return {b: n for b, n in alloc.items() if n > 0}
-
-def get_coverage(scheds):
-    cov = np.zeros((24, 7), int)
-    for sc in scheds:
-        for di, sh in enumerate(sc.shifts):
-            if sh.is_working:
-                for h in sh.get_hours(): cov[h, di] += 1
-    return cov
-
-# ============================================================
-# EFT OPTIMIZER
-# ============================================================
-
-def make_eft_schedule():
-    off = random.randint(0, 6)
-    return DriverSchedule([DriverShift(-1, False) if d == off
-        else DriverShift(random.randint(0, 23), True, random.randint(8, 12)) for d in range(7)])
-
-def fix_eft(s):
-    wd = s.get_work_days()
-    while wd < 6:
-        offs = [i for i, sh in enumerate(s.shifts) if not sh.is_working]
-        if not offs: break
-        s.shifts[random.choice(offs)] = DriverShift(random.randint(0, 23), True, random.randint(8, 12)); wd += 1
-    while wd > 6:
-        wks = [i for i, sh in enumerate(s.shifts) if sh.is_working]
-        if not wks: break
-        s.shifts[random.choice(wks)] = DriverShift(-1, False); wd -= 1
-
-def eft_fitness(scheds, n, cases, car_cap):
-    profit = 0.0
-    for day in range(7):
-        for hr in range(24):
-            active = sum(1 for i in range(n) if i < len(scheds) and hr in scheds[i].shifts[day].get_hours())
-            if active > int(car_cap[hr, day]): return -999999.0
-            if active > 0:
-                ci = min(active - 1, len(cases) - 1); profit += cases[ci][hr, day]
-    for i in range(n):
-        if i < len(scheds) and scheds[i].get_work_days() != 6: profit -= 1000
-    return profit
-
-def optimize_eft_size(cases, car_cap, size, pop_size=100, gens=50):
-    if size == 0: return 0.0, []
-    pop = []
-    for _ in range(pop_size):
-        t = [make_eft_schedule() for _ in range(size)]
-        pop.append((t, eft_fitness(t, size, cases, car_cap)))
-    for _ in range(gens):
-        pop.sort(key=lambda x: x[1], reverse=True)
-        el = int(pop_size * 0.2); new = pop[:el]
-        while len(new) < pop_size:
-            par = random.choice(pop[:el])
-            child = [copy.deepcopy(s) for s in par[0]]; idx = random.randint(0, size - 1)
-            if random.random() < 0.35: child[idx] = make_eft_schedule()
-            else:
-                s = child[idx]; d = random.randint(0, 6)
-                if s.shifts[d].is_working:
-                    if random.random() < 0.5:
-                        s.shifts[d] = DriverShift((s.shifts[d].start_hour + random.randint(-2, 2)) % 24, True, s.shifts[d].shift_length)
-                    else:
-                        s.shifts[d] = DriverShift(s.shifts[d].start_hour, True, max(8, min(12, s.shifts[d].shift_length + random.choice([-1, 1]))))
-                if s.get_work_days() != 6: fix_eft(s)
-            new.append((child, eft_fitness(child, size, cases, car_cap)))
-        pop = new
-    best = max(pop, key=lambda x: x[1])
-    return best[1], best[0]
-
-def auto_optimal_eft(cases, car_cap, pop_size=100, gens=50):
-    best_sz, best_p, best_sc = 0, 0.0, []; prev = 0.0
-    for sz in range(1, 7):
-        p, sc = optimize_eft_size(cases, car_cap, sz, pop_size, gens)
-        if p > prev and p > 0: best_sz = sz; best_p = p; best_sc = sc; prev = p
-        else: break
-    return best_sz, best_p, best_sc
-
-# ============================================================
-# ATTRIBUTION
-# ============================================================
-
-def compute_attribution(branch, scheds, cases, demand_dict, capacity, logics, bt):
-    results = []; cum_p = 0.0; cum_o = 0
-    for ei in range(len(scheds)):
-        cov = np.zeros((24, 7), int)
-        for e in range(ei + 1):
-            for di, sh in enumerate(scheds[e].shifts):
-                if sh.is_working:
-                    for h in sh.get_hours(): cov[h, di] += 1
-        pn = 0.0
-        for h in range(24):
-            for d in range(7):
-                n = cov[h, d]
-                if n > 0: ci = min(n-1, len(cases)-1); pn += cases[ci][h, d]
-        on = 0
-        for h in range(24):
-            for day in range(1, 8):
-                n = int(cov[h, day-1]); dem = demand_dict.get((branch, h, day), 0)
-                if n == 0 or dem == 0: continue
-                cap = capacity.get((branch, day), 2.0)
-                lk = logics.get((n, min(dem, 12), cap), {'util': 0})
-                util = min(lk['util'], 1.0); served = round(min(util * cap * n, dem)); on += served
-        ep = pn - cum_p; eo = on - cum_o; cum_p = pn; cum_o = on
-        th = 0; parts = []
-        sc = scheds[ei]
-        for di, sh in enumerate(sc.shifts):
-            dn = DAY_NAMES[di]
-            if sh.is_working:
-                s = sh.start_hour; e = (s + sh.shift_length) % 24
-                parts.append(f"{dn} {s:02d}:00-{e:02d}:00"); th += sh.shift_length
-            else: parts.append(f"{dn} OFF")
-        results.append({'Branch': branch, 'Employee': f"E{ei+1}", 'Marginal_Profit': round(ep, 2),
-            'Cumulative_Profit': round(cum_p, 2), 'Marginal_Orders': eo, 'Cumulative_Orders': cum_o,
-            'Weekly_Hours': th, 'Schedule': " | ".join(parts)})
-    return results
-
-# ============================================================
-# EXPORT
-# ============================================================
-
-def to_excel(sft_res, eft_res=None):
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine='openpyxl') as w:
-        s = {'Saudi_Drivers': sft_res['total_drivers'], 'Saudi_Profit': round(sft_res['total_profit'], 2)}
-        if eft_res:
-            s['Expat_Drivers'] = eft_res['total_drivers']; s['Expat_Profit'] = round(eft_res['total_profit'], 2)
-            s['Combined'] = sft_res['total_drivers'] + eft_res['total_drivers']
-        pd.DataFrame([s]).to_excel(w, sheet_name='Summary', index=False)
-        sft_res['alloc_df'].to_excel(w, sheet_name='Saudi_Allocations', index=False)
-        sft_res['sched_df'].to_excel(w, sheet_name='Saudi_Schedules', index=False)
-        sft_res['cov_df'].to_excel(w, sheet_name='Saudi_Coverage', index=False)
-        if 'attr_df' in sft_res and not sft_res['attr_df'].empty:
-            sft_res['attr_df'].to_excel(w, sheet_name='Saudi_Attribution', index=False)
-        if 'marg_df' in sft_res and not sft_res['marg_df'].empty:
-            sft_res['marg_df'].to_excel(w, sheet_name='Marginal_Analysis', index=False)
-        if eft_res:
-            eft_res['alloc_df'].to_excel(w, sheet_name='Expat_Allocations', index=False)
-            eft_res['sched_df'].to_excel(w, sheet_name='Expat_Schedules', index=False)
-            eft_res['cov_df'].to_excel(w, sheet_name='Expat_Coverage', index=False)
-            if 'attr_df' in eft_res and not eft_res['attr_df'].empty:
-                eft_res['attr_df'].to_excel(w, sheet_name='Expat_Attribution', index=False)
-            if eft_res.get('viol_df') is not None and not eft_res['viol_df'].empty:
-                eft_res['viol_df'].to_excel(w, sheet_name='Car_Violations', index=False)
-    return buf.getvalue()
-
-def fmt_sched(scheds, dtype="Saudi"):
-    texts = []
-    for i, sc in enumerate(scheds, 1):
-        parts = []
-        for di, sh in enumerate(sc.shifts):
-            dn = DAY_NAMES[di]
-            if sh.is_working:
-                s = sh.start_hour; e = (s + sh.shift_length) % 24
-                p = f"{dn} {s:02d}:00-{e:02d}:00"
-                if dtype == "Expat": p += f"({sh.shift_length}h)"
-                parts.append(p)
-            else: parts.append(f"{dn} OFF")
-        texts.append(f"Driver {i} ({dtype}): " + " | ".join(parts))
-    return texts
-
-# ============================================================
-# AUTHENTICATION
-# ============================================================
-
-USERS = {
-    "admin": "DailyFood@2026",
-    "subham": "delivery123",
-}
-
+# ═══════════════════ AUTH ═══════════════════
+USERS = {"admin":"DailyFood@2026","subham":"delivery123"}
 def check_login():
-    if 'authenticated' not in st.session_state:
-        st.session_state['authenticated'] = False
-
-    if st.session_state['authenticated']:
-        return True
-
-    st.title("🔒 Driver Hiring Engine")
-    st.caption("Please login to continue")
-
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        if st.button("Login", type="primary", use_container_width=True):
-            if username in USERS and USERS[username] == password:
-                st.session_state['authenticated'] = True
-                st.session_state['username'] = username
-                st.rerun()
-            else:
-                st.error("Invalid username or password")
+    if st.session_state.get('auth'): return True
+    st.markdown("<h1 style='text-align:center'>🍕 Maestro Pizza</h1><h3 style='text-align:center;color:#666!important'>Driver & MC Hiring Engine</h3>",unsafe_allow_html=True)
+    c1,c2,c3=st.columns([1,2,1])
+    with c2:
+        u=st.text_input("Username"); p=st.text_input("Password",type="password")
+        if st.button("🔓 Login",use_container_width=True):
+            if u in USERS and USERS[u]==p: st.session_state['auth']=True; st.session_state['user']=u; st.rerun()
+            else: st.error("Invalid credentials")
     return False
 
-# ============================================================
-# MAIN APP
-# ============================================================
+# ═══════════════════ DATA STRUCTURES ═══════════════════
+@dataclass
+class Shift:
+    start_hour:int; is_working:bool; length:int=8
+    def hrs(self):
+        if not self.is_working or self.start_hour<0: return []
+        return [(self.start_hour+i)%24 for i in range(self.length)]
+    def hr_set(self): return set(self.hrs())
 
+@dataclass
+class Schedule:
+    shifts:List[Shift]=field(default_factory=list)
+    def wdays(self): return sum(1 for s in self.shifts if s.is_working)
+    def total_hrs(self): return sum(s.length for s in self.shifts if s.is_working)
+
+@dataclass
+class MCSchedule:
+    mc_id:int; shifts:List[Shift]=field(default_factory=list)
+    def wdays(self): return sum(1 for s in self.shifts if s.is_working)
+    def total_hrs(self): return sum(s.length for s in self.shifts if s.is_working)
+    def valid(self): return 6<=self.wdays()<=7
+
+@dataclass
+class MCTeam:
+    n:int; schedules:List[MCSchedule]=field(default_factory=list)
+    def active_at(self,day,hr):
+        return [i for i,s in enumerate(self.schedules) if i<self.n and s.shifts[day].is_working and hr in s.shifts[day].hr_set()]
+
+# ═══════════════════ DATA LOADING ═══════════════════
+@st.cache_data(show_spinner=False)
+def load_sft(fb):
+    l5=pd.read_excel(fb,sheet_name='Logics_5D',header=2); l5.columns=['D','DM','TC','U','I','AC','P']
+    lg5={};
+    for _,r in l5.dropna(subset=['D']).iterrows(): lg5[(int(r['D']),int(r['DM']),float(r['TC']))]=({'p':float(r['P']),'u':float(r['U'])})
+    l6=pd.read_excel(fb,sheet_name='Logics_6D',header=2); l6.columns=['D','DM','TC','U','I','AC','P']
+    lg6={};
+    for _,r in l6.dropna(subset=['D']).iterrows(): lg6[(int(r['D']),int(r['DM']),float(r['TC']))]=({'p':float(r['P']),'u':float(r['U'])})
+    cd=pd.read_excel(fb,sheet_name='Capacity',header=2); cd.columns=[str(c).strip() for c in cd.columns]
+    cap={};
+    for _,r in cd.dropna(subset=['branch_name']).iterrows(): cap[(str(r['branch_name']).strip(),int(r['Weekday (shift)']))]=float(r['Adj.m'])
+    sm=pd.read_excel(fb,sheet_name='Staffing model_5D',header=None,skiprows=4)
+    dem={}; bt={}; brs=[]; pb=''
+    for _,row in sm.iterrows():
+        b=str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ''; 
+        if not b or b=='Branch': continue
+        h=int(row.iloc[1]) if pd.notna(row.iloc[1]) else 0
+        for d in range(7): v=row.iloc[2+d]; dem[(b,h,d+1)]=int(v) if pd.notna(v) and str(v).strip()!='' else 0
+        if h==0:
+            if b!=pb: brs.append(b); pb=b
+            bs=str(row.iloc[70]).strip().upper() if len(row)>70 and pd.notna(row.iloc[70]) else ''
+            bt[b]='6D' if bs=='6D' else '5D'
+    return lg5,lg6,cap,dem,bt,brs
+
+@st.cache_data(show_spinner=False)
+def load_eft(fb):
+    ld=pd.read_excel(fb,sheet_name='Logics EFT',header=0); ld.columns=[c.strip() for c in ld.columns]
+    le={};
+    for _,r in ld.dropna(subset=['DRIVERS']).iterrows(): le[(int(r['DRIVERS']),int(r['DEMAND']),float(r['T. CAPACITY']))]=({'p':float(r['PROFIT/HR. (vs. 3P)']),'u':float(r['UTILIZATION  %'])})
+    cd=pd.read_excel(fb,sheet_name='Capacity',header=2); cd.columns=[c.strip() for c in cd.columns]
+    ce={};
+    for _,r in cd.dropna(subset=['branch_name']).iterrows(): ce[(str(r['branch_name']).strip(),int(r['Weekday (shift)']))]=float(r['Adj.m'])
+    return le,ce
+
+@st.cache_data(show_spinner=False)
+def load_cars(fb):
+    df=pd.read_excel(fb); df.columns=['Branch','Hr']+[str(d) for d in range(1,8)]
+    c={};
+    for b in df['Branch'].unique():
+        bd=df[df['Branch']==b]; m=np.zeros((24,7),int)
+        for _,r in bd.iterrows():
+            h=int(r['Hr'])
+            if 0<=h<24:
+                for d in range(7): m[h,d]=int(r[str(d+1)])
+        c[str(b).strip()]=m
+    return c
+
+@st.cache_data(show_spinner=False)
+def load_restr(fb):
+    if fb is None: return set()
+    return set(pd.read_excel(fb).iloc[:,0].astype(str).str.strip())
+
+# ═══════════════════ CASE GENERATION ═══════════════════
+def gen_cases(brs,dem,cap,lg,bt,tt):
+    cm={}
+    for b in brs:
+        if bt.get(b)!=tt: continue
+        ms=[]
+        for cn in range(1,7):
+            m=np.zeros((24,7))
+            for h in range(24):
+                for d in range(1,8):
+                    dm=min(dem.get((b,h,d),0),12); cp=cap.get((b,d),2.0)
+                    lk=lg.get((cn,dm,cp))
+                    if lk: m[h,d-1]=lk['p']
+            ms.append(m)
+        cm[b]=ms
+    return cm
+
+def gen_mc_cases(brs,rem,cap,lg,bt):
+    """Generate MC Case1-3 from remaining orders using same logics"""
+    cm={}
+    for b in brs:
+        ms=[]
+        for cn in range(1,4): # MC uses Case1-3
+            m=np.zeros((24,7))
+            for h in range(24):
+                for d in range(1,8):
+                    dm=min(rem.get((b,h,d),0),12); cp=cap.get((b,d),2.0)
+                    lk=lg.get((cn,dm,cp))
+                    if lk:
+                        # MC cases compute orders served (using util), not profit
+                        u=min(lk['u'],1.0)
+                        served=round(min(u*cp*cn,dm))
+                        m[h,d-1]=served
+            ms.append(m)
+        if any(m.sum()>0 for m in ms): cm[b]=ms
+    return cm
+
+def comp_remaining(brs,dem,cap,lg5,lg6,bt,scov):
+    rem={}
+    for b in brs:
+        t=bt.get(b,'5D'); lg=lg5 if t=='5D' else lg6
+        sc=scov.get(b,np.zeros((24,7),int))
+        for h in range(24):
+            for d in range(1,8):
+                dm=dem.get((b,h,d),0); dr=int(sc[h,d-1])
+                if dr==0 or dm==0: rem[(b,h,d)]=dm; continue
+                cp=cap.get((b,d),2.0); lk=lg.get((dr,min(dm,12),cp),{'u':0})
+                u=min(lk['u'],1.0); sv=round(min(u*cp*dr,dm)); rem[(b,h,d)]=max(dm-sv,0)
+    return rem
+
+# ═══════════════════ SFT OPTIMIZER ═══════════════════
+def mk_sched(st_):
+    s=random.randint(0,23)
+    if st_=='5D': o1=random.randint(0,6); os={o1,(o1+1)%7}
+    else: os={random.randint(0,6)}
+    return Schedule([Shift(-1,False) if d in os else Shift((s+random.randint(-2,2))%24,True) for d in range(7)])
+
+def mk_stag(st_,di,n):
+    tb=[[16,17,18],[19,20,21],[8,9,10],[11,12,13],[14,15],[22,23,0]]
+    b=tb[di%len(tb)]; s=random.choice(b)
+    if st_=='5D': o1=(di*2)%7; os={o1,(o1+1)%7}
+    else: os={(di*2)%7}
+    return Schedule([Shift(-1,False) if d in os else Shift((s+random.randint(-1,1))%24,True) for d in range(7)])
+
+def sft_profit(scs,cas,cm):
+    cv=np.zeros((24,7),int)
+    for sc in scs:
+        for di,sh in enumerate(sc.shifts):
+            if sh.is_working:
+                for h in sh.hrs(): cv[h,di]+=1
+    if cm is not None and np.any(cv>cm): return -999999.0
+    t=0.0
+    for h in range(24):
+        for d in range(7):
+            n=cv[h,d]
+            if n>0: ci=min(n-1,len(cas)-1); t+=cas[ci][h,d]
+    return t
+
+def opt_size(nd,st_,cas,cm,ps=100,gs=60):
+    if nd==0: return 0.0,[]
+    mc=int(cm.max()); co=nd>mc
+    if co: ps=max(ps,200); gs=max(gs,100)
+    pop=[]
+    for pi in range(ps):
+        if co and pi<ps//2: tm=[mk_stag(st_,i,nd) for i in range(nd)]
+        else: tm=[mk_sched(st_) for _ in range(nd)]
+        pop.append((tm,sft_profit(tm,cas,cm)))
+    for _ in range(gs):
+        pop.sort(key=lambda x:x[1],reverse=True); el=max(1,int(ps*0.2)); nw=pop[:el]
+        while len(nw)<ps:
+            pr=random.choice(pop[:el]); ch=[copy.deepcopy(s) for s in pr[0]]; ix=random.randint(0,nd-1)
+            if random.random()<0.3:
+                if co and random.random()<0.5: ch[ix]=mk_stag(st_,ix,nd)
+                else: ch[ix]=mk_sched(st_)
+            else:
+                for i,sh in enumerate(ch[ix].shifts):
+                    if sh.is_working: ch[ix].shifts[i]=Shift((sh.start_hour+random.choice([-2,-1,0,1,2]))%24,True); break
+            nw.append((ch,sft_profit(ch,cas,cm)))
+        pop=nw
+    best=max(pop,key=lambda x:x[1]); return best[1],best[0]
+
+def build_lookup(brs,bt,c5,c6,cars,restr,ps,gs,cb=None):
+    lk={}; el=[b for b in brs if b not in restr]
+    for ix,b in enumerate(el):
+        t=bt.get(b,'5D'); cs=c5.get(b,[]) if t=='5D' else c6.get(b,[])
+        cm=cars.get(b,np.full((24,7),6))
+        if not cs: continue
+        lk[b]={0:(0.0,[])}
+        for sz in range(1,min(7,len(cs)+1)):
+            p,sc=opt_size(sz,t,cs,cm,ps,gs); lk[b][sz]=(p,sc)
+            if sz>=2:
+                m1=lk[b][sz][0]-lk[b][sz-1][0]; m0=lk[b][sz-1][0]-lk[b][sz-2][0]
+                if m1<-500 and m0<-500:
+                    for s in range(sz+1,min(7,len(cs)+1)): lk[b][s]=(p-999999,[])
+                    break
+        if cb: cb(ix+1,len(el),b)
+    return lk
+
+def greedy_real(tgt,lk):
+    al={b:0 for b in lk}
+    for _ in range(tgt):
+        bb,bm=None,-float('inf')
+        for b in lk:
+            ns=al[b]+1
+            if ns not in lk[b]: continue
+            pn=lk[b][ns][0]
+            if pn<=-999000: continue
+            m=pn-lk[b][al[b]][0]
+            if m>bm: bm=m; bb=b
+        if bb: al[bb]+=1
+        else: break
+    return {b:n for b,n in al.items() if n>0}
+
+def get_cov(scs):
+    cv=np.zeros((24,7),int)
+    for sc in scs:
+        for di,sh in enumerate(sc.shifts):
+            if sh.is_working:
+                for h in sh.hrs(): cv[h,di]+=1
+    return cv
+
+# ═══════════════════ EFT OPTIMIZER ═══════════════════
+def mk_eft():
+    o=random.randint(0,6)
+    return Schedule([Shift(-1,False) if d==o else Shift(random.randint(0,23),True,random.randint(8,12)) for d in range(7)])
+
+def fix_eft(s):
+    w=s.wdays()
+    while w<6:
+        os=[i for i,sh in enumerate(s.shifts) if not sh.is_working]
+        if not os: break
+        s.shifts[random.choice(os)]=Shift(random.randint(0,23),True,random.randint(8,12)); w+=1
+    while w>6:
+        ws=[i for i,sh in enumerate(s.shifts) if sh.is_working]
+        if not ws: break
+        s.shifts[random.choice(ws)]=Shift(-1,False); w-=1
+
+def eft_fit(scs,n,cas,cc):
+    p=0.0
+    for dy in range(7):
+        for hr in range(24):
+            a=sum(1 for i in range(n) if i<len(scs) and hr in scs[i].shifts[dy].hrs())
+            if a>int(cc[hr,dy]): return -999999.0
+            if a>0: ci=min(a-1,len(cas)-1); p+=cas[ci][hr,dy]
+    for i in range(n):
+        if i<len(scs) and scs[i].wdays()!=6: p-=1000
+    return p
+
+def opt_eft(cas,cc,sz,ps=100,gs=50):
+    if sz==0: return 0.0,[]
+    pop=[]
+    for _ in range(ps):
+        t=[mk_eft() for _ in range(sz)]; pop.append((t,eft_fit(t,sz,cas,cc)))
+    for _ in range(gs):
+        pop.sort(key=lambda x:x[1],reverse=True); el=int(ps*0.2); nw=pop[:el]
+        while len(nw)<ps:
+            pr=random.choice(pop[:el]); ch=[copy.deepcopy(s) for s in pr[0]]; ix=random.randint(0,sz-1)
+            if random.random()<0.35: ch[ix]=mk_eft()
+            else:
+                s=ch[ix]; d=random.randint(0,6)
+                if s.shifts[d].is_working:
+                    if random.random()<0.5: s.shifts[d]=Shift((s.shifts[d].start_hour+random.randint(-2,2))%24,True,s.shifts[d].length)
+                    else: s.shifts[d]=Shift(s.shifts[d].start_hour,True,max(8,min(12,s.shifts[d].length+random.choice([-1,1]))))
+                if s.wdays()!=6: fix_eft(s)
+            nw.append((ch,eft_fit(ch,sz,cas,cc)))
+        pop=nw
+    return max(pop,key=lambda x:x[1])
+
+def auto_eft(cas,cc,ps=100,gs=50):
+    bs,bp,bsc=0,0.0,[]; pv=0.0
+    for sz in range(1,7):
+        p,sc=opt_eft(cas,cc,sz,ps,gs)
+        if p>pv and p>0: bs=sz; bp=p; bsc=sc; pv=p
+        else: break
+    return bs,bp,bsc
+
+# ═══════════════════ MC OPTIMIZER ═══════════════════
+def mk_mc(mid):
+    sh=[Shift(random.randint(0,23),True,random.randint(8,12)) if random.random()>0.12 else Shift(-1,False) for _ in range(7)]
+    sc=MCSchedule(mid,sh); w=sc.wdays()
+    while w<6:
+        os=[i for i,s in enumerate(sc.shifts) if not s.is_working]
+        if not os: break
+        sc.shifts[random.choice(os)]=Shift(random.randint(0,23),True,random.randint(8,12)); w+=1
+    while w>7:
+        ws=[i for i,s in enumerate(sc.shifts) if s.is_working]
+        if not ws: break
+        sc.shifts[random.choice(ws)]=Shift(-1,False); w-=1
+    return sc
+
+def mc_team_orders(cas,team):
+    t=0.0; nc=len(cas)
+    for dy in range(7):
+        for hr in range(24):
+            na=len(team.active_at(dy,hr))
+            if na>0: ci=min(na-1,nc-1); t+=cas[ci][hr,dy]
+    return t
+
+def mc_indiv_orders(cas,team,mi):
+    t=0.0
+    for dy in range(7):
+        sh=team.schedules[mi].shifts[dy]
+        if not sh.is_working: continue
+        for hr in sh.hr_set():
+            if hr>=24: continue
+            act=team.active_at(dy,hr); na=len(act)
+            if na==1: t+=cas[0][hr,dy]
+            elif na==2:
+                v=cas[min(1,len(cas)-1)][hr,dy]; rk=act.index(mi) if mi in act else 0
+                t+=math.ceil(v/2) if rk==0 else math.floor(v/2)
+            elif na>=3:
+                v=cas[min(2,len(cas)-1)][hr,dy]; rk=act.index(mi) if mi in act else 0
+                base=math.floor(v/3); rem=v-(base*3)
+                t+=base+1 if rk<rem else base
+    return t
+
+def mc_fitness(cas,team,thr):
+    if team.n==0: return 0.0
+    pen=0.0
+    for mi in range(team.n):
+        if mi>=len(team.schedules): pen+=10000; continue
+        sc=team.schedules[mi]
+        if not sc.valid(): pen+=5000; continue
+        hrs=sc.total_hrs(); ords=mc_indiv_orders(cas,team,mi)
+        if ords<int(hrs*thr): pen+=10000
+    if pen>0: return -pen
+    return mc_team_orders(cas,team)
+
+def opt_mc_branch(cas,max_mc,thr,ps=200,gs=100):
+    pop=[]
+    for _ in range(ps):
+        n=random.randint(0,max_mc); scs=[mk_mc(i) for i in range(n)]
+        tm=MCTeam(n,scs); pop.append((tm,mc_fitness(cas,tm,thr)))
+    for _ in range(gs):
+        pop.sort(key=lambda x:x[1],reverse=True); el=int(ps*0.15); nw=pop[:el]
+        while len(nw)<ps:
+            pr=random.choice(pop[:el]); ch=MCTeam(pr[0].n,[copy.deepcopy(s) for s in pr[0].schedules])
+            r=random.random()
+            if r<0.2: # change team size
+                ch.n=random.randint(0,max_mc)
+                while len(ch.schedules)<ch.n: ch.schedules.append(mk_mc(len(ch.schedules)))
+                ch.schedules=ch.schedules[:ch.n]
+            elif r<0.5 and ch.n>0: # replace one MC
+                ix=random.randint(0,ch.n-1); ch.schedules[ix]=mk_mc(ix)
+            elif ch.n>0: # tweak shift
+                ix=random.randint(0,ch.n-1); dy=random.randint(0,6)
+                sh=ch.schedules[ix].shifts[dy]
+                if sh.is_working:
+                    ch.schedules[ix].shifts[dy]=Shift((sh.start_hour+random.randint(-2,2))%24,True,max(8,min(12,sh.length+random.choice([-1,0,1]))))
+            nw.append((ch,mc_fitness(cas,ch,thr)))
+        pop=nw
+    return max(pop,key=lambda x:x[1])
+
+# ═══════════════════ ATTRIBUTION ═══════════════════
+def attrib(br,scs,cas,dem,cap,lg,bt_):
+    res=[]; cp=0.0; co=0
+    for ei in range(len(scs)):
+        cv=np.zeros((24,7),int)
+        for e in range(ei+1):
+            for di,sh in enumerate(scs[e].shifts):
+                if sh.is_working:
+                    for h in sh.hrs(): cv[h,di]+=1
+        pn=0.0
+        for h in range(24):
+            for d in range(7):
+                n=cv[h,d]
+                if n>0: ci=min(n-1,len(cas)-1); pn+=cas[ci][h,d]
+        on=0
+        for h in range(24):
+            for dy in range(1,8):
+                n=int(cv[h,dy-1]); dm=dem.get((br,h,dy),0)
+                if n==0 or dm==0: continue
+                c=cap.get((br,dy),2.0); lk=lg.get((n,min(dm,12),c),{'u':0})
+                u=min(lk['u'],1.0); sv=round(min(u*c*n,dm)); on+=sv
+        ep=pn-cp; eo=on-co; cp=pn; co=on; th=0; pts=[]
+        sc=scs[ei]
+        for di,sh in enumerate(sc.shifts):
+            dn=DN[di]
+            if sh.is_working: s=sh.start_hour; e=(s+sh.length)%24; pts.append(f"{dn} {s:02d}:00-{e:02d}:00"); th+=sh.length
+            else: pts.append(f"{dn} OFF")
+        res.append({'Branch':br,'Employee':f"E{ei+1}",'Marginal_Profit':round(ep,2),'Cum_Profit':round(cp,2),
+            'Marginal_Orders':eo,'Cum_Orders':co,'Hours':th,'Productivity':round(eo/th,2) if th>0 else 0,'Schedule':" | ".join(pts)})
+    return res
+
+# ═══════════════════ EXPORT ═══════════════════
+def to_xl(data):
+    buf=io.BytesIO()
+    with pd.ExcelWriter(buf,engine='openpyxl') as w:
+        for name,df in data.items():
+            if df is not None and not df.empty: df.to_excel(w,sheet_name=name[:31],index=False)
+    return buf.getvalue()
+
+def fmt_sc(scs,dt="Saudi"):
+    tx=[]
+    for i,sc in enumerate(scs,1):
+        pts=[]
+        for di,sh in enumerate(sc.shifts):
+            dn=DN[di]
+            if sh.is_working:
+                s=sh.start_hour; e=(s+sh.length)%24; p=f"{dn} {s:02d}:00-{e:02d}:00"
+                if dt=="Expat": p+=f"({sh.length}h)"
+                pts.append(p)
+            else: pts.append(f"{dn} OFF")
+        tx.append(f"Driver {i} ({dt}): "+" | ".join(pts))
+    return tx
+
+# ═══════════════════ MAIN APP ═══════════════════
 def main():
-    if not check_login():
-        return
+    if not check_login(): return
 
-    st.title("🚗 Driver Hiring Engine v3")
-    st.caption(f"Saudi (real marginals + staggered) + Expat Pipeline — Logged in as: {st.session_state.get('username', '')}")
+    st.markdown("<h1 style='text-align:center'>🍕 Maestro Pizza — Hiring Engine</h1>",unsafe_allow_html=True)
+    st.markdown(f"<p style='text-align:center;color:#666'>Logged in as: <b>{st.session_state.get('user','')}</b></p>",unsafe_allow_html=True)
 
+    # Stage status
+    s1=st.session_state.get('s1_done',False); s2=st.session_state.get('s2_done',False)
+    s3=st.session_state.get('s3_done',False); s4=st.session_state.get('s4_done',False)
+
+    # Campaign map
+    st.markdown("---")
+    c1,c2,c3,c4=st.columns(4)
+    for c,num,name,icon,done,unlocked in [
+        (c1,1,"Saudi Hiring","⚔️",s1,True),(c2,2,"Expat Hiring","🏹",s2,s1),
+        (c3,3,"SFT+EFT Scheduling","🏰",s3,s2),(c4,4,"MC Scheduling","🐉",s4,s3)]:
+        cls="stage-done" if done else ("stage-card" if unlocked else "stage-card stage-locked")
+        status="✅ Complete" if done else ("🔓 Ready" if unlocked else "🔒 Locked")
+        c.markdown(f"<div class='{cls}'><h2>{icon}</h2><h3>Stage {num}</h3><p>{name}</p><small>{status}</small></div>",unsafe_allow_html=True)
+    st.markdown("---")
+
+    # Sidebar
     with st.sidebar:
-        st.header("📁 Input Files")
-        sft_file = st.file_uploader("1. SFT Developer File", type=['xlsm', 'xlsx'])
-        eft_file = st.file_uploader("2. EFT Developer File", type=['xlsm', 'xlsx'])
-        cars_file = st.file_uploader("3. Cars Restriction", type=['xlsx'])
-        restricted_file = st.file_uploader("4. Restricted Branches (optional)", type=['xlsx'])
-        st.divider(); st.header("⚙️ Settings")
-        target = st.number_input("Target Saudi Drivers", 1, 500, 150)
-        test_mode = st.checkbox("Test mode (10 branches)", False)
-        st.divider(); st.header("🧬 GA Tuning")
-        pop_size = st.slider("Population", 40, 300, 100)
-        gens = st.slider("Generations", 20, 150, 60)
-        show_attr = st.checkbox("Employee attribution", True)
+        st.markdown("### 📁 Files")
+        sft_f=st.file_uploader("SFT Developer",type=['xlsm','xlsx'])
+        eft_f=st.file_uploader("EFT Developer",type=['xlsm','xlsx'])
+        cars_f=st.file_uploader("Cars Restriction",type=['xlsx'])
+        restr_f=st.file_uploader("Restricted Branches",type=['xlsx'])
+        mc_restr_f=st.file_uploader("MC Restriction",type=['xlsx'])
+        st.markdown("---"); st.markdown("### ⚙️ Settings")
+        tgt=st.number_input("Target Saudi",1,500,150)
+        test=st.checkbox("Test (10 branches)")
+        ps=st.slider("GA Pop",40,300,100); gs=st.slider("GA Gens",20,150,60)
 
-    if not sft_file:
-        st.info("👈 Upload SFT Developer File to begin")
-        return
+    # Load data
+    if not sft_f: st.info("👈 Upload SFT Developer File to begin the campaign"); return
+    with st.spinner("Loading..."): lg5,lg6,cap,dem,bt,brs=load_sft(sft_f)
+    restr=load_restr(restr_f) if restr_f else set()
+    if test: brs=brs[:10]
 
-    with st.spinner("Loading SFT data..."):
-        logics_5d, logics_6d, capacity, demand, branch_types, branches = load_sft_data(sft_file)
-    restricted = load_restricted(restricted_file) if restricted_file else set()
-    if test_mode: branches = branches[:10]
+    # ═══ STAGE 1: Saudi Hiring ═══
+    stage=st.radio("Select Stage",["⚔️ Stage 1: Saudi Hiring","🏹 Stage 2: Expat Hiring","🏰 Stage 3: SFT+EFT Scheduling","🐉 Stage 4: MC Scheduling"],horizontal=True)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Branches", len(branches))
-    c2.metric("5D", sum(1 for b in branches if branch_types.get(b) == '5D'))
-    c3.metric("6D", sum(1 for b in branches if branch_types.get(b) == '6D'))
-    c4.metric("Restricted", len(restricted))
+    if "Stage 1" in stage:
+        st.header("⚔️ Stage 1: Saudi Hiring (Real Marginals)")
+        c1,c2,c3=st.columns(3); c1.metric("Branches",len(brs)); c2.metric("5D",sum(1 for b in brs if bt.get(b)=='5D')); c3.metric("6D",sum(1 for b in brs if bt.get(b)=='6D'))
 
-    # ==================== PHASE 1: SAUDI ====================
-    st.header("🟢 Phase 1: Saudi Hiring (Real Marginals)")
+        if st.button("🚀 Launch Saudi Campaign",type="primary",use_container_width=True):
+            t0=time.time(); pg=st.progress(0,"Generating cases...")
+            c5=gen_cases(brs,dem,cap,lg5,bt,'5D'); c6=gen_cases(brs,dem,cap,lg6,bt,'6D')
+            cars=load_cars(cars_f) if cars_f else {}
+            pg.progress(5,"Building profit lookup...")
+            def cb(d,t,b): pg.progress(5+int(75*d/max(t,1)),f"Lookup {d}/{t}: {b}")
+            lk=build_lookup(brs,bt,c5,c6,cars,restr,ps,gs,cb)
+            pg.progress(82,"Allocating..."); al=greedy_real(tgt,lk)
+            ar,sr,cr,atr,mr=[],[],[],[],[]
+            scov={}
+            for b in sorted(al):
+                n=al[b]; p,scs=lk[b][n]; t_=bt.get(b,'5D')
+                ar.append({'Branch':b,'5D/6D':t_,'Drivers':n,'Profit':round(p,2)})
+                for tx in fmt_sc(scs,"Saudi"): sr.append({'Branch':b,'Schedule':tx})
+                cv=get_cov(scs); scov[b]=cv
+                for h in range(24):
+                    row={'Branch':b,'Hour':h}
+                    for d in range(7): row[str(d+1)]=int(cv[h,d])
+                    cr.append(row)
+                cs=c5.get(b,[]) if t_=='5D' else c6.get(b,[])
+                lg=lg5 if t_=='5D' else lg6
+                if cs and scs: atr.extend(attrib(b,scs,cs,dem,cap,lg,t_))
+            for b in sorted(lk):
+                for sz in sorted(lk[b]):
+                    if sz==0: continue
+                    p=lk[b][sz][0]; pv=lk[b].get(sz-1,(0.0,[]))[0]
+                    mr.append({'Branch':b,'Size':sz,'Profit':round(p,2),'Marginal':round(p-pv,2),'Used':al.get(b,0)>=sz})
+            st.session_state['sft']={'al':pd.DataFrame(ar).sort_values('Profit',ascending=False),'sc':pd.DataFrame(sr),
+                'cv':pd.DataFrame(cr),'at':pd.DataFrame(atr),'mg':pd.DataFrame(mr),
+                'td':sum(al.values()),'tp':sum(lk[b][n][0] for b,n in al.items()),'scov':scov,'al_d':al}
+            st.session_state['c5']=c5; st.session_state['c6']=c6; st.session_state['s1_done']=True
+            pg.progress(100,f"Done in {time.time()-t0:.0f}s")
 
-    if st.button("🚀 Run Saudi Optimization", type="primary", use_container_width=True):
-        t0 = time.time()
-        prog = st.progress(0, "Generating case matrices...")
-        cases_5d = generate_cases(branches, demand, capacity, logics_5d, branch_types, '5D')
-        cases_6d = generate_cases(branches, demand, capacity, logics_6d, branch_types, '6D')
-        cars = load_cars_data(cars_file) if cars_file else {}
-        prog.progress(5, f"Cases: {len(cases_5d)} 5D + {len(cases_6d)} 6D")
+        if 'sft' in st.session_state:
+            s=st.session_state['sft']; c1,c2,c3=st.columns(3)
+            c1.metric("Saudi Drivers",s['td']); c2.metric("Branches",len(s['al'])); c3.metric("Profit",f"{s['tp']:,.2f}")
+            tabs=st.tabs(["Allocations","Schedules","Coverage","Attribution","Marginals"])
+            with tabs[0]: st.dataframe(s['al'],use_container_width=True,height=400)
+            with tabs[1]: st.dataframe(s['sc'],use_container_width=True,height=400)
+            with tabs[2]: st.dataframe(s['cv'],use_container_width=True,height=400)
+            with tabs[3]:
+                if not s['at'].empty: st.dataframe(s['at'],use_container_width=True,height=400)
+            with tabs[4]:
+                if not s['mg'].empty: st.dataframe(s['mg'],use_container_width=True,height=400)
+            st.download_button("📥 Download Saudi Results",to_xl({'Summary':pd.DataFrame([{'Drivers':s['td'],'Profit':round(s['tp'],2)}]),'Allocations':s['al'],'Schedules':s['sc'],'Coverage':s['cv'],'Attribution':s['at'],'Marginals':s['mg']}),file_name="Saudi_Results.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        prog.progress(6, "Building profit lookup (GA per branch per size)...")
-        def pb(done, total, br):
-            pct = 6 + int(74 * done / max(total, 1))
-            prog.progress(pct, f"Lookup {done}/{total}: {br}")
+    elif "Stage 2" in stage:
+        st.header("🏹 Stage 2: Expat Hiring")
+        if not s1: st.warning("🔒 Complete Stage 1 first"); return
+        if not eft_f: st.warning("Upload EFT Developer File"); return
+        if not cars_f: st.warning("Upload Cars Restriction"); return
 
-        lookup = build_profit_lookup(branches, branch_types, cases_5d, cases_6d,
-                                     cars, restricted, pop_size, gens, pb)
-        prog.progress(80, f"Lookup: {len(lookup)} branches. Allocating...")
-
-        alloc = greedy_allocate_real(target, lookup)
-        prog.progress(85, f"Allocated {sum(alloc.values())} drivers")
-
-        # Build output
-        al_rows, sc_rows, cv_rows, at_rows, mg_rows = [], [], [], [], []
-        saudi_cov = {}
-        for br in sorted(alloc.keys()):
-            n = alloc[br]; p, scheds = lookup[br][n]
-            bt = branch_types.get(br, '5D')
-            al_rows.append({'Branch': br, '5D/6D': bt, 'Drivers': n, 'Profit': round(p, 2)})
-            for txt in fmt_sched(scheds, "Saudi"):
-                sc_rows.append({'Branch': br, 'Drivers': n, 'Profit': round(p, 2), 'Schedule': txt})
-            cov = get_coverage(scheds); saudi_cov[br] = cov
-            for hr in range(24):
-                row = {'Branch': br, '5D/6D': bt, 'Hour': hr}
-                for d in range(7): row[str(d+1)] = int(cov[hr, d])
-                cv_rows.append(row)
-            if show_attr and scheds:
-                cs = cases_5d.get(br, []) if bt == '5D' else cases_6d.get(br, [])
-                lg = logics_5d if bt == '5D' else logics_6d
-                if cs: at_rows.extend(compute_attribution(br, scheds, cs, demand, capacity, lg, bt))
-
-        for br in sorted(lookup.keys()):
-            for sz in sorted(lookup[br].keys()):
-                if sz == 0: continue
-                p = lookup[br][sz][0]; prev = lookup[br].get(sz-1, (0.0, []))[0]
-                mg_rows.append({'Branch': br, 'Size': sz, 'GA_Profit': round(p, 2),
-                    'Marginal': round(p - prev, 2), 'Allocated': alloc.get(br, 0) >= sz})
-
-        sft_res = {
-            'alloc_df': pd.DataFrame(al_rows).sort_values('Profit', ascending=False),
-            'sched_df': pd.DataFrame(sc_rows), 'cov_df': pd.DataFrame(cv_rows),
-            'attr_df': pd.DataFrame(at_rows), 'marg_df': pd.DataFrame(mg_rows),
-            'total_drivers': sum(alloc.values()),
-            'total_profit': sum(lookup[b][n][0] for b, n in alloc.items()),
-            'saudi_cov': saudi_cov, 'alloc': alloc,
-        }
-        st.session_state['sft'] = sft_res
-        st.session_state['cases_5d'] = cases_5d; st.session_state['cases_6d'] = cases_6d
-        prog.progress(100, f"Done in {time.time()-t0:.0f}s")
-
-    if 'sft' in st.session_state:
-        sft = st.session_state['sft']
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Saudi Drivers", sft['total_drivers'])
-        c2.metric("Branches", len(sft['alloc_df']))
-        c3.metric("Profit", f"{sft['total_profit']:,.2f}")
-
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(["Allocations", "Schedules", "Coverage", "Attribution", "Marginal Analysis"])
-        with tab1: st.dataframe(sft['alloc_df'], use_container_width=True, height=400)
-        with tab2: st.dataframe(sft['sched_df'], use_container_width=True, height=400)
-        with tab3: st.dataframe(sft['cov_df'], use_container_width=True, height=400)
-        with tab4:
-            if not sft['attr_df'].empty: st.dataframe(sft['attr_df'], use_container_width=True, height=400)
-        with tab5:
-            if not sft['marg_df'].empty: st.dataframe(sft['marg_df'], use_container_width=True, height=400)
-
-        if 'eft' not in st.session_state:
-            st.download_button("📥 Download Saudi Results", data=to_excel(sft),
-                file_name="Saudi_Results.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-        # ==================== PHASE 2: EXPAT ====================
-        st.header("🔵 Phase 2: Expat Hiring")
-        if not eft_file: st.warning("Upload EFT Developer File"); return
-        if not cars_file: st.warning("Upload Cars Restriction"); return
-
-        if st.button("🚀 Run Expat Optimization", type="primary", use_container_width=True):
-            t0 = time.time(); p2 = st.progress(0, "Loading EFT...")
-            logics_eft, cap_eft = load_eft_data(eft_file)
-            cars = load_cars_data(cars_file); scov = sft['saudi_cov']
-            p2.progress(5, "Computing remaining orders...")
-            remaining = compute_remaining(branches, demand, capacity, logics_5d, logics_6d, branch_types, scov)
-            p2.progress(15, "Generating EFT cases...")
-            eft_cases = {}
-            for br in branches:
-                mats = []
-                for cn in range(1, 7):
-                    mat = np.zeros((24, 7))
-                    for hr in range(24):
-                        for day in range(1, 8):
-                            dem = min(remaining.get((br, hr, day), 0), 12)
-                            cap = cap_eft.get((br, day), 2.0)
-                            lk = logics_eft.get((cn, dem, cap))
-                            if lk: mat[hr, day-1] = lk['profit']
-                    mats.append(mat)
-                if any(m.sum() > 0 for m in mats): eft_cases[br] = mats
-            p2.progress(25, f"EFT: {len(eft_cases)} branches")
-            ea, es_d, ep_d = {}, {}, {}; done = 0
-            for br, cs in eft_cases.items():
-                tc = cars.get(br, np.full((24,7),2,int))
-                sc = scov.get(br, np.zeros((24,7),int))
-                ecap = np.maximum(tc - sc.astype(int), 0)
-                sz, p, scheds = auto_optimal_eft(cs, ecap, pop_size, gens)
-                if sz > 0: ea[br] = sz; es_d[br] = scheds; ep_d[br] = p
-                done += 1; p2.progress(25 + int(65*done/max(len(eft_cases),1)), f"EFT {done}/{len(eft_cases)}: {br}")
-
-            ea_r, es_r, ec_r, ev_r, eat_r = [], [], [], [], []
-            for br in sorted(ea.keys()):
-                n = ea[br]; p = ep_d[br]; bt = branch_types.get(br, '5D')
-                ea_r.append({'Branch': br, '5D/6D': bt, 'EFT_Drivers': n, 'Profit': round(p, 2)})
-                for txt in fmt_sched(es_d[br], "Expat"):
-                    es_r.append({'Branch': br, 'EFT_Drivers': n, 'Profit': round(p, 2), 'Schedule': txt})
-                tc = cars.get(br, np.full((24,7),2,int)); sc = scov.get(br, np.zeros((24,7),int))
-                for hr in range(24):
-                    row = {'Branch': br, 'Hour': hr}
+        if st.button("🚀 Launch Expat Campaign",type="primary",use_container_width=True):
+            t0=time.time(); pg=st.progress(0,"Loading EFT...")
+            le,ce=load_eft(eft_f); cars=load_cars(cars_f); scov=st.session_state['sft']['scov']
+            pg.progress(5,"Computing remaining orders...")
+            rem=comp_remaining(brs,dem,cap,lg5,lg6,bt,scov)
+            pg.progress(15,"EFT cases...")
+            ec={}
+            for b in brs:
+                ms=[]
+                for cn in range(1,7):
+                    m=np.zeros((24,7))
+                    for h in range(24):
+                        for d in range(1,8):
+                            dm=min(rem.get((b,h,d),0),12); cp=ce.get((b,d),2.0)
+                            lk=le.get((cn,dm,cp))
+                            if lk: m[h,d-1]=lk['p']
+                    ms.append(m)
+                if any(m.sum()>0 for m in ms): ec[b]=ms
+            pg.progress(25,f"EFT: {len(ec)} branches")
+            ea,esd,epd={},{},{}; dn_=0
+            for b,cs in ec.items():
+                tc=cars.get(b,np.full((24,7),2,int)); sc=scov.get(b,np.zeros((24,7),int))
+                ecp=np.maximum(tc-sc.astype(int),0)
+                sz,p,scs=auto_eft(cs,ecp,ps,gs)
+                if sz>0: ea[b]=sz; esd[b]=scs; epd[b]=p
+                dn_+=1; pg.progress(25+int(65*dn_/max(len(ec),1)),f"EFT {dn_}/{len(ec)}: {b}")
+            ear,esr,ecr,evr,eatr=[],[],[],[],[]
+            for b in sorted(ea):
+                n=ea[b]; p=epd[b]; t_=bt.get(b,'5D')
+                ear.append({'Branch':b,'EFT':n,'Profit':round(p,2)})
+                for tx in fmt_sc(esd[b],"Expat"): esr.append({'Branch':b,'Schedule':tx})
+                tc=cars.get(b,np.full((24,7),2,int)); sc=scov.get(b,np.zeros((24,7),int))
+                for h in range(24):
+                    row={'Branch':b,'Hour':h}
                     for d in range(7):
-                        e_a = sum(1 for s in es_d[br] if s.shifts[d].is_working and hr in s.shifts[d].get_hours())
-                        sa = int(sc[hr, d]); row[f'E{d+1}'] = e_a; row[f'S{d+1}'] = sa
-                        row[f'T{d+1}'] = e_a+sa; row[f'C{d+1}'] = int(tc[hr, d])
-                        if e_a+sa > int(tc[hr, d]):
-                            ev_r.append({'Branch': br, 'Hour': hr, 'Day': d+1, 'EFT': e_a, 'Saudi': sa, 'Total': e_a+sa, 'Cars': int(tc[hr, d])})
-                    ec_r.append(row)
-                if show_attr and es_d[br]:
-                    eat_r.extend(compute_attribution(br, es_d[br], eft_cases[br], remaining, cap_eft, logics_eft, bt))
-
-            eft_res = {
-                'alloc_df': pd.DataFrame(ea_r).sort_values('Profit', ascending=False) if ea_r else pd.DataFrame(),
-                'sched_df': pd.DataFrame(es_r), 'cov_df': pd.DataFrame(ec_r),
-                'viol_df': pd.DataFrame(ev_r), 'attr_df': pd.DataFrame(eat_r),
-                'total_drivers': sum(ea.values()), 'total_profit': sum(ep_d.values()),
-            }
-            st.session_state['eft'] = eft_res; st.session_state['remaining'] = remaining
-            p2.progress(100, f"Done in {time.time()-t0:.0f}s")
+                        ea_=sum(1 for s in esd[b] if s.shifts[d].is_working and h in s.shifts[d].hrs())
+                        sa=int(sc[h,d]); row[f'E{d+1}']=ea_; row[f'S{d+1}']=sa; row[f'T{d+1}']=ea_+sa; row[f'C{d+1}']=int(tc[h,d])
+                        if ea_+sa>int(tc[h,d]): evr.append({'Branch':b,'Hour':h,'Day':d+1,'Excess':ea_+sa-int(tc[h,d])})
+                    ecr.append(row)
+            st.session_state['eft']={'al':pd.DataFrame(ear).sort_values('Profit',ascending=False),'sc':pd.DataFrame(esr),
+                'cv':pd.DataFrame(ecr),'vl':pd.DataFrame(evr),'td':sum(ea.values()),'tp':sum(epd.values())}
+            st.session_state['rem']=rem; st.session_state['s2_done']=True
+            pg.progress(100,f"Done in {time.time()-t0:.0f}s")
 
         if 'eft' in st.session_state:
-            eft = st.session_state['eft']
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Expat Drivers", eft['total_drivers']); c2.metric("Branches", len(eft['alloc_df']))
-            c3.metric("Expat Profit", f"{eft['total_profit']:,.2f}")
-            viol = len(eft.get('viol_df', pd.DataFrame()))
-            c4.metric("Car Violations", viol)
-            tab1, tab2, tab3, tab4 = st.tabs(["Allocations", "Schedules", "Coverage", "Attribution"])
-            with tab1: st.dataframe(eft['alloc_df'], use_container_width=True, height=400)
-            with tab2: st.dataframe(eft['sched_df'], use_container_width=True, height=400)
-            with tab3: st.dataframe(eft['cov_df'], use_container_width=True, height=400)
-            with tab4:
-                if not eft['attr_df'].empty: st.dataframe(eft['attr_df'], use_container_width=True, height=400)
+            e=st.session_state['eft']; c1,c2,c3=st.columns(3)
+            c1.metric("Expat Drivers",e['td']); c2.metric("Branches",len(e['al'])); c3.metric("Profit",f"{e['tp']:,.2f}")
+            tabs=st.tabs(["Allocations","Schedules","Coverage"])
+            with tabs[0]: st.dataframe(e['al'],use_container_width=True,height=400)
+            with tabs[1]: st.dataframe(e['sc'],use_container_width=True,height=400)
+            with tabs[2]: st.dataframe(e['cv'],use_container_width=True,height=400)
 
-            st.header("📊 Combined"); sft = st.session_state['sft']
-            c1, c2 = st.columns(2)
-            c1.metric("Total Drivers", sft['total_drivers'] + eft['total_drivers'])
-            c2.metric("Total Profit", f"{sft['total_profit'] + eft['total_profit']:,.2f}")
-            st.download_button("📥 Download Complete Results", data=to_excel(sft, eft),
-                file_name="Driver_Hiring_Complete.xlsx", type="primary", use_container_width=True,
+    elif "Stage 3" in stage:
+        st.header("🏰 Stage 3: SFT+EFT Combined Scheduling")
+        if not s2: st.warning("🔒 Complete Stage 2 first"); return
+        st.info("Stage 3 uses the SFT+EFT Scheduling code (Employee_restriction_.xlsx based). Upload the scheduling output or run the standalone SFT_EFT code, then use the Employee Attribution VBA for profit/order/hours/productivity per employee.")
+        st.markdown("**Employee Attribution VBA** has been provided separately for the `Th_Saudis_(8h_5d).xlsm` file.")
+        st.session_state['s3_done']=True
+
+    elif "Stage 4" in stage:
+        st.header("🐉 Stage 4: MC Scheduling")
+        if not s3: st.warning("🔒 Complete Stage 3 first"); return
+
+        if st.button("🚀 Launch MC Campaign",type="primary",use_container_width=True):
+            t0=time.time(); pg=st.progress(0,"Generating MC cases...")
+            rem=st.session_state.get('rem',{})
+            if not rem: st.error("No remaining orders from Stage 2"); return
+
+            # MC cases from remaining orders
+            mc_cas=gen_mc_cases(brs,rem,cap,lg5,bt)
+            pg.progress(10,f"MC cases: {len(mc_cas)} branches")
+
+            # Load MC restrictions
+            mc_restr={}
+            if mc_restr_f:
+                df=pd.read_excel(mc_restr_f)
+                for _,r in df.iterrows():
+                    b=str(r.iloc[0]).strip()
+                    if len(r)>1 and pd.notna(r.iloc[1]): mc_restr[b]=int(r.iloc[1])
+
+            # Dual threshold run
+            r1_yes,r1_no=[],[]
+            done=0; total=len(mc_cas)
+            for b,cas in mc_cas.items():
+                mx=mc_restr.get(b,3)
+                best=opt_mc_branch(cas,mx,0.8,ps,gs)
+                if best[1]>0: r1_yes.append((b,best[0],best[1]))
+                else: r1_no.append(b)
+                done+=1; pg.progress(10+int(60*done/max(total,1)),f"MC 0.8: {done}/{total} {b}")
+
+            # Run 2: retry at 0.6
+            r2=[]
+            if r1_no:
+                pg.progress(72,f"Retrying {len(r1_no)} branches at 0.6...")
+                for ix,b in enumerate(r1_no):
+                    if b not in mc_cas: continue
+                    cas=mc_cas[b]; mx=mc_restr.get(b,3)
+                    best=opt_mc_branch(cas,mx,0.6,ps,gs)
+                    if best[1]>0: r2.append((b,best[0],best[1]))
+                    pg.progress(72+int(25*(ix+1)/max(len(r1_no),1)),f"MC 0.6: {ix+1}/{len(r1_no)}")
+
+            all_mc=r1_yes+r2
+            mar,msr=[],[]
+            for b,team,ords in all_mc:
+                mar.append({'Branch':b,'MCs':team.n,'Weekly_Orders':round(ords,1)})
+                for mi in range(team.n):
+                    sc=team.schedules[mi]; pts=[]
+                    for di,sh in enumerate(sc.shifts):
+                        dn_=DN[di]
+                        if sh.is_working: s=sh.start_hour; e=(s+sh.length)%24; pts.append(f"{dn_} {s:02d}:00-{e:02d}:00({sh.length}h)")
+                        else: pts.append(f"{dn_} OFF")
+                    msr.append({'Branch':b,'MC':f"MC_{mi+1}",'Hours':sc.total_hrs(),'Orders':round(mc_indiv_orders(mc_cas[b],team,mi),1),'Schedule':" | ".join(pts)})
+
+            st.session_state['mc']={'al':pd.DataFrame(mar).sort_values('Weekly_Orders',ascending=False),'sc':pd.DataFrame(msr),
+                'td':sum(t.n for _,t,_ in all_mc),'to':sum(o for _,_,o in all_mc)}
+            st.session_state['s4_done']=True
+            pg.progress(100,f"Done in {time.time()-t0:.0f}s")
+
+        if 'mc' in st.session_state:
+            m=st.session_state['mc']; c1,c2,c3=st.columns(3)
+            c1.metric("Total MCs",m['td']); c2.metric("Branches",len(m['al'])); c3.metric("Weekly Orders",f"{m['to']:,.0f}")
+            tabs=st.tabs(["Allocations","Schedules"])
+            with tabs[0]: st.dataframe(m['al'],use_container_width=True,height=400)
+            with tabs[1]: st.dataframe(m['sc'],use_container_width=True,height=400)
+
+    # Combined download
+    if s1:
+        st.markdown("---")
+        st.header("📥 Download All Results")
+        sheets={}
+        if 'sft' in st.session_state:
+            s=st.session_state['sft']
+            sheets['Saudi_Alloc']=s['al']; sheets['Saudi_Sched']=s['sc']; sheets['Saudi_Cov']=s['cv']
+            sheets['Saudi_Attrib']=s['at']; sheets['Saudi_Marginals']=s['mg']
+        if 'eft' in st.session_state:
+            e=st.session_state['eft']
+            sheets['Expat_Alloc']=e['al']; sheets['Expat_Sched']=e['sc']; sheets['Expat_Cov']=e['cv']
+        if 'mc' in st.session_state:
+            m=st.session_state['mc']
+            sheets['MC_Alloc']=m['al']; sheets['MC_Sched']=m['sc']
+        if sheets:
+            st.download_button("📥 Download Complete Campaign Results",to_xl(sheets),
+                file_name="Maestro_Pizza_Campaign_Results.xlsx",type="primary",use_container_width=True,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-if __name__ == "__main__":
-    main()
+if __name__=="__main__": main()
